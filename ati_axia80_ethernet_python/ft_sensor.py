@@ -76,7 +76,7 @@ class ForceTorqueSensorDriver:
             except Exception as e:
                 print(f"Error in read loop: {e}")
 
-    def start(self):
+    def start(self, timeout=3.0):
         """
         Start the data acquisition thread.
         """
@@ -84,6 +84,13 @@ class ForceTorqueSensorDriver:
         self._send_command(command=0x0002, sample_count=0)  # Start continuous streaming
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
+
+        # Block until the first reading is available
+        start_time = time.time()
+        while self.latest_reading is None:
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Timeout waiting for first reading")
+            time.sleep(1/50)  # 50 Hz
 
     def stop(self):
         """
@@ -93,6 +100,10 @@ class ForceTorqueSensorDriver:
         self._send_command(command=0x0000)  # Stop streaming
         if self.thread.is_alive():
             self.thread.join()
+
+        # Clear the latest reading
+        with self.lock:
+            self.latest_reading = None
 
     def get_latest_reading(self):
         """
