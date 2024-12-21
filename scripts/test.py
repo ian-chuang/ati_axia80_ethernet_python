@@ -18,7 +18,7 @@ if __name__ == "__main__":
         print()
 
         while True:
-            reading = driver.get_latest_reading()
+            reading = driver.get_wrench()
             if reading:
                 print(reading)
 

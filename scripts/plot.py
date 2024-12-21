@@ -11,7 +11,7 @@ def update_plot(frame):
     global wrench_data
 
     # Get latest wrench data
-    wrench = driver.get_latest_wrench()
+    wrench = driver.get_wrench()
     
     # Shift data to the left and append new data
     wrench_data[:-1] = wrench_data[1:]

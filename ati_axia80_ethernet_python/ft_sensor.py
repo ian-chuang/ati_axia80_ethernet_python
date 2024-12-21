@@ -1,9 +1,74 @@
 import socket
 import struct
-import threading
 import requests
 import xml.etree.ElementTree as ET
 import time
+import multiprocessing
+
+def read_loop(sensor_ip, sensor_port, calpf, calpt, force_torque_data, data_lock, stop_event):
+    """
+    Thread loop to read data continuously from the sensor.
+    Args:
+        sensor_ip (str): IP address of the sensor.
+        sensor_port (int): UDP port for the sensor communication.
+        force_torque_data (multiprocessing.Array): Shared memory array for force-torque data.
+        lock (multiprocessing.Lock): Lock for accessing shared memory.
+        stop_event (multiprocessing.Event): Event to stop the thread.
+    """
+    sensor_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sensor_socket.settimeout(1.0)  # Set timeout for socket operations
+
+    def send_command(command, sample_count=0):
+        """
+        Send a command to the sensor.
+
+        Args:
+            command (int): Command code.
+            sample_count (int): Number of samples to output (0 for continuous).
+        """
+        command_header = 0x1234
+        request = struct.pack('!HHI', command_header, command, sample_count)
+        sensor_socket.sendto(request, (sensor_ip, sensor_port))
+
+    send_command(command=0x0002, sample_count=0)  # Start continuous streaming
+
+    while not stop_event.is_set():
+        try:
+            data, _ = sensor_socket.recvfrom(1024)
+
+            if len(data) == 36:  # Minimum packet size
+                parsed_data = struct.unpack('!IIIiiiiii', data[:36])
+
+                rdt_sequence = parsed_data[0]
+                ft_sequence = parsed_data[1]
+                status = parsed_data[2]
+                Fx = parsed_data[3] / calpf
+                Fy = parsed_data[4] / calpf
+                Fz = parsed_data[5] / calpf
+                Tx = parsed_data[6] / calpt 
+                Ty = parsed_data[7] / calpt
+                Tz = parsed_data[8] / calpt
+                
+                with data_lock:
+                    force_torque_data[:] = [Fx, Fy, Fz, Tx, Ty, Tz]
+
+            else:
+                print(f"Warning: Unexpected packet size {len(data)}")
+
+        except socket.timeout:
+            print(f"WARNING: Timeout reading from sensor, retrying...")
+            send_command(command=0x0002, sample_count=0) # retry
+
+        except KeyboardInterrupt:
+            print(f"Stopping the force-torque sensor driver...")
+            break
+
+        except Exception as e:
+            print(f"Error in read loop: {e}")
+
+    send_command(command=0x0000)  # Stop streaming
+    sensor_socket.close()
+
 
 class ForceTorqueSensorDriver:
     def __init__(self, sensor_ip, sensor_port=49152):
@@ -19,10 +84,6 @@ class ForceTorqueSensorDriver:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(1.0)  # Set timeout for socket operations
 
-        self.running = False
-        self.latest_reading = None
-        self.lock = threading.Lock()
-
         calibration = self.get_calibration_data()
 
         # Extract counts per force and torque unit
@@ -32,119 +93,63 @@ class ForceTorqueSensorDriver:
         except (ValueError, TypeError):
             raise ValueError("Calibration data not available or invalid")
 
-    def _send_command(self, command, sample_count=0):
-        """
-        Send a command to the sensor.
-
-        Args:
-            command (int): Command code.
-            sample_count (int): Number of samples to output (0 for continuous).
-        """
-        command_header = 0x1234
-        request = struct.pack('!HHI', command_header, command, sample_count)
-        self.socket.sendto(request, (self.sensor_ip, self.sensor_port))
-
-    def _read_loop(self):
-        """
-        Thread loop to read data continuously from the sensor.
-        """
-        while self.running:
-            try:
-                start_time = time.time()
-                data, _ = self.socket.recvfrom(1024)
-                end_time = time.time()
-                if len(data) == 36:  # Minimum packet size
-                    parsed_data = struct.unpack('!IIIiiiiii', data[:36])
-                    reading = {
-                        'rdt_sequence': parsed_data[0],
-                        'ft_sequence': parsed_data[1],
-                        'status': parsed_data[2],
-                        'Fx': parsed_data[3],
-                        'Fy': parsed_data[4],
-                        'Fz': parsed_data[5],
-                        'Tx': parsed_data[6],
-                        'Ty': parsed_data[7],
-                        'Tz': parsed_data[8],
-                        'delta_t': end_time - start_time,
-                    }
-                    with self.lock:
-                        self.latest_reading = reading
-                else:
-                    print(f"Warning: Unexpected packet size {len(data)}")
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"Error in read loop: {e}")
+        self.thread = None
+        self.force_torque_data = multiprocessing.Array('d', [float('nan')] * 6)  # 'd' means double (float)
+        self.data_lock = multiprocessing.Lock()
+        self.stop_event = multiprocessing.Event()
 
     def start(self, timeout=3.0):
         """
         Start the data acquisition thread.
         """
-        self.running = True
-        self._send_command(command=0x0002, sample_count=0)  # Start continuous streaming
-        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+
+        # check that the thread is not already running
+        if self.thread is not None and self.thread.is_alive():
+            raise RuntimeError("Sensor driver is already running")
+
+        # clear the latest reading and event
+        with self.data_lock:
+            self.force_torque_data[:] = [float('nan')] * 6
+
+        self.stop_event.clear()
+
+        self.thread = multiprocessing.Process(
+            target=read_loop,
+            args=(self.sensor_ip, self.sensor_port, self.calcpf, self.calcpt, self.force_torque_data, self.data_lock, self.stop_event)
+        )
         self.thread.start()
 
         # Block until the first reading is available
         start_time = time.time()
-        while self.latest_reading is None:
+        while True:
+
+            with self.data_lock:
+                if self.force_torque_data[0] != float('nan'):
+                    break
+
             if time.time() - start_time > timeout:
                 raise TimeoutError("Timeout waiting for first reading")
+            
             time.sleep(1/50)  # 50 Hz
 
     def stop(self):
         """
         Stop the data acquisition thread.
         """
-        self.running = False
-        self._send_command(command=0x0000)  # Stop streaming
-        if self.thread.is_alive():
-            self.thread.join()
+        self.stop_event.set()
+        self.thread.join()
 
         # Clear the latest reading
-        with self.lock:
-            self.latest_reading = None
+        with self.data_lock:
+            self.force_torque_data[:] = [float('nan')] * 6
 
-    def get_latest_reading(self):
-        """
-        Get the most recent force-torque data, converted to N and Nm if calibration data is available.
-
-        Returns:
-            dict: Latest force-torque data or None if no data is available.
-        """
-        with self.lock:
-            if self.latest_reading is None:
-                return None
-
-            if self.calcpf and self.calcpt:
-                # Convert raw readings to N and Nm
-                return {
-                    'rdt_sequence': self.latest_reading['rdt_sequence'],
-                    'ft_sequence': self.latest_reading['ft_sequence'],
-                    'status': self.latest_reading['status'],
-                    'Fx': self.latest_reading['Fx'] / self.calcpf,
-                    'Fy': self.latest_reading['Fy'] / self.calcpf,
-                    'Fz': self.latest_reading['Fz'] / self.calcpf,
-                    'Tx': self.latest_reading['Tx'] / self.calcpt,
-                    'Ty': self.latest_reading['Ty'] / self.calcpt,
-                    'Tz': self.latest_reading['Tz'] / self.calcpt,
-                    'delta_t': self.latest_reading['delta_t'],
-                }
-            else:
-                return self.latest_reading
-            
-    def get_latest_wrench(self):
-        with self.lock:
-            if self.latest_reading is None:
-                return None
-            return [
-                self.latest_reading['Fx'] / self.calcpf,
-                self.latest_reading['Fy'] / self.calcpf,
-                self.latest_reading['Fz'] / self.calcpf,
-                self.latest_reading['Tx'] / self.calcpt,
-                self.latest_reading['Ty'] / self.calcpt,
-                self.latest_reading['Tz'] / self.calcpt
-            ]
+    def get_wrench(self):
+        # check if the thread is running
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError("Sensor driver is not running")
+        
+        with self.data_lock:
+            return list(self.force_torque_data)
 
     def get_sensor_configuration(self):
         """
@@ -187,4 +192,3 @@ class ForceTorqueSensorDriver:
         except requests.RequestException as e:
             print(f"Error fetching calibration data: {e}")
             return None
-
